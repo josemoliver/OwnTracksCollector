@@ -1,0 +1,362 @@
+@page "/reports"
+@attribute [Authorize]
+@inject LocationQueryService LocationSvc
+@inject ReportQueryService   ReportSvc
+@inject IJSRuntime           JS
+
+<PageTitle>Reports — TrackViewer</PageTitle>
+
+<div class="tv-export-page">
+    <nav class="tv-navbar">
+        <div class="tv-navbar-brand">
+            <i class="bi bi-map-fill"></i>
+            TrackViewer
+        </div>
+        <a href="/" class="tv-navbar-btn">
+            <i class="bi bi-arrow-left"></i>
+            <span class="d-none d-md-inline">Back to map</span>
+        </a>
+        <div class="tv-navbar-spacer"></div>
+        <form method="post" action="/account/logout" style="margin:0">
+            <button type="submit" class="tv-navbar-btn" title="Sign out">
+                <i class="bi bi-box-arrow-right"></i>
+            </button>
+        </form>
+    </nav>
+
+    <div style="max-width:820px;margin:2rem auto;padding:0 1rem">
+        <h2 class="mb-4" style="color:var(--tv-text-primary);font-size:1.25rem">
+            <i class="bi bi-bar-chart-line me-2" style="color:var(--tv-accent)"></i>
+            Reports
+        </h2>
+
+        @* Filters *@
+        <div class="tv-card mb-4">
+            <div class="tv-card-header">Report: Days with track data</div>
+            <div class="tv-card-body">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem">
+                    <div>
+                        <label class="tv-label">From</label>
+                        <input type="date" class="tv-input"
+                               value="@(_from?.ToString("yyyy-MM-dd") ?? "")"
+                               @onchange="e => _from = ParseDate(e.Value?.ToString())" />
+                    </div>
+                    <div>
+                        <label class="tv-label">To</label>
+                        <input type="date" class="tv-input"
+                               value="@(_to?.ToString("yyyy-MM-dd") ?? "")"
+                               @onchange="e => _to = ParseDate(e.Value?.ToString())" />
+                    </div>
+                    <div>
+                        <label class="tv-label">Time zone</label>
+                        <select class="tv-input" value="@_tz.Id" @onchange="OnTimeZoneChanged">
+                            @foreach (var tz in _timeZones)
+                            {
+                                <option value="@tz.Id">@tz.DisplayName</option>
+                            }
+                        </select>
+                    </div>
+                </div>
+
+                <div class="tv-quick-ranges mt-2">
+                    <button class="tv-quick-btn" @onclick="() => SetQuickRange(-7)">7 days</button>
+                    <button class="tv-quick-btn" @onclick="() => SetQuickRange(-30)">30 days</button>
+                    <button class="tv-quick-btn" @onclick="() => SetQuickRange(-90)">90 days</button>
+                    <button class="tv-quick-btn" @onclick="() => SetQuickRange(-365)">1 year</button>
+                    <button class="tv-quick-btn" @onclick="() => SetQuickRange(null)">All</button>
+                </div>
+
+                @if (_allDevices.Count > 0)
+                {
+                    <div style="margin-top:1rem">
+                        <label class="tv-label">Devices</label>
+                        @foreach (var dev in _allDevices)
+                        {
+                            var d = dev;
+                            <label class="tv-device-row" style="display:inline-flex;margin-right:1rem">
+                                <input type="checkbox" class="form-check-input"
+                                       checked="@_selectedDevices.Contains(d)"
+                                       @onchange="() => ToggleDevice(d)" />
+                                <i class="bi bi-phone-fill" style="color:var(--tv-accent)"></i>
+                                <span class="tv-device-name">@d.User/@d.Device</span>
+                            </label>
+                        }
+                    </div>
+                }
+
+                <button class="tv-btn tv-btn-primary mt-3" @onclick="RunReportAsync"
+                        disabled="@(_loading || _selectedDevices.Count == 0)">
+                    @if (_loading)
+                    {
+                        <i class="bi bi-arrow-repeat spin me-1"></i><span>Running…</span>
+                    }
+                    else
+                    {
+                        <i class="bi bi-play-fill me-1"></i><span>Run report</span>
+                    }
+                </button>
+            </div>
+        </div>
+
+        @if (_errorMessage is not null)
+        {
+            <div class="alert alert-danger py-2 px-3 mb-3" role="alert">
+                <i class="bi bi-exclamation-octagon-fill me-1"></i>@_errorMessage
+            </div>
+        }
+
+        @if (_days is not null)
+        {
+            @* Summary *@
+            <div class="rp-summary mb-4">
+                <div class="rp-tile"><div class="rp-val">@_days.Count</div><div class="rp-lbl">Days with data</div></div>
+                <div class="rp-tile"><div class="rp-val">@_daysInRange</div><div class="rp-lbl">Days in range</div></div>
+                <div class="rp-tile"><div class="rp-val">@(_daysInRange - _days.Count)</div><div class="rp-lbl">Days without</div></div>
+                <div class="rp-tile"><div class="rp-val">@_totalPoints.ToString("N0")</div><div class="rp-lbl">Points</div></div>
+                <div class="rp-tile"><div class="rp-val">@_longestStreak</div><div class="rp-lbl">Longest streak (days)</div></div>
+                <div class="rp-tile">
+                    <div class="rp-val">@(_busiest is null ? "–" : _busiest.Date.ToString("yyyy-MM-dd"))</div>
+                    <div class="rp-lbl">Busiest day@(_busiest is null ? "" : $" ({_busiest.Points:N0} pts)")</div>
+                </div>
+            </div>
+
+            @if (_days.Count == 0)
+            {
+                <p style="color:var(--tv-text-muted);font-size:13px">No track data in this range.</p>
+            }
+            else
+            {
+                @if (_strip.Count > 0)
+                {
+                    <div class="tv-card mb-4">
+                        <div class="tv-card-header">Coverage</div>
+                        <div class="tv-card-body">
+                            <div class="rp-strip">
+                                @foreach (var (date, has) in _strip)
+                                {
+                                    @if (has)
+                                    {
+                                        <a class="rp-cell on" href="@MapUrl(date)" title="@date.ToString("ddd yyyy-MM-dd") — open on map"></a>
+                                    }
+                                    else
+                                    {
+                                        <span class="rp-cell" title="@date.ToString("ddd yyyy-MM-dd")"></span>
+                                    }
+                                }
+                            </div>
+                        </div>
+                    </div>
+                }
+
+                <div class="tv-card mb-4">
+                    <div class="tv-card-header" style="display:flex;align-items:center">
+                        Days
+                        <button class="tv-quick-btn ms-auto" @onclick="ExportCsvAsync" title="Download this table as CSV">
+                            <i class="bi bi-filetype-csv me-1"></i>Export CSV
+                        </button>
+                    </div>
+                    <div class="tv-card-body" style="max-height:480px;overflow:auto;padding:0">
+                        <table class="rp-table">
+                            <thead>
+                                <tr><th>Date</th><th>Points</th><th>Devices</th><th>First fix</th><th>Last fix</th></tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var day in _days.OrderByDescending(d => d.Date))
+                                {
+                                    <tr>
+                                        <td><a href="@MapUrl(day.Date)" title="Open on map">@day.Date.ToString("ddd yyyy-MM-dd")</a></td>
+                                        <td>@day.Points.ToString("N0")</td>
+                                        <td>@day.Devices</td>
+                                        <td>@day.FirstFix.ToString("HH:mm")</td>
+                                        <td>@day.LastFix.ToString("HH:mm")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            }
+        }
+    </div>
+</div>
+
+<style>
+    .spin { display:inline-block; animation: spin .8s linear infinite; }
+    @@keyframes spin { to { transform: rotate(360deg); } }
+    .tv-label { font-size:12px; color:var(--tv-text-muted); display:block; margin-bottom:.25rem; }
+    .rp-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:.75rem; }
+    .rp-tile { background:var(--tv-surface, rgba(128,128,128,.12)); border-radius:8px; padding:.75rem; }
+    .rp-val { font-size:1.25rem; font-weight:700; color:var(--tv-text-primary); }
+    .rp-lbl { font-size:11px; color:var(--tv-text-muted); }
+    .rp-strip { display:flex; flex-wrap:wrap; gap:3px; }
+    .rp-cell { width:12px; height:12px; border-radius:2px; background:rgba(128,128,128,.25); }
+    .rp-cell.on { background:var(--tv-accent); }
+    a.rp-cell.on:hover { outline:2px solid var(--tv-text-primary); }
+    .rp-table a { color:var(--tv-accent); text-decoration:none; }
+    .rp-table a:hover { text-decoration:underline; }
+    .rp-table { width:100%; border-collapse:collapse; font-size:13px; color:var(--tv-text-primary); }
+    .rp-table th, .rp-table td { padding:.45rem .75rem; text-align:left; }
+    .rp-table thead th { position:sticky; top:0; background:var(--tv-surface, #222); font-size:12px; color:var(--tv-text-muted); }
+    .rp-table tbody tr:nth-child(even) { background:rgba(128,128,128,.08); }
+</style>
+
+@code {
+    private const int MaxStripDays = 800;
+
+    private List<DeviceIdentifier>    _allDevices      = [];
+    private HashSet<DeviceIdentifier> _selectedDevices = [];
+    private List<TimeZoneInfo>        _timeZones       = [];
+    private TimeZoneInfo              _tz              = TimeZoneInfo.Local;
+    private DateTime?                 _from;
+    private DateTime?                 _to;
+    private bool                      _loading;
+    private string?                   _errorMessage;
+
+    // results
+    private IReadOnlyList<DaySummary>? _days;
+    private List<(DateOnly Date, bool Has)> _strip = [];
+    private int         _daysInRange;
+    private long        _totalPoints;
+    private int         _longestStreak;
+    private DaySummary? _busiest;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _allDevices      = (await LocationSvc.GetDevicesAsync()).ToList();
+        _selectedDevices = _allDevices.ToHashSet();
+        _timeZones       = TimeZoneInfo.GetSystemTimeZones().ToList();
+        EnsureTimeZoneListed(_tz);
+        SetQuickRange(-30);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        // Prefer the browser's time zone over the server's
+        try
+        {
+            var id = await JS.InvokeAsync<string>("MapInterop.getBrowserTimeZone");
+            if (!string.IsNullOrEmpty(id) && id != _tz.Id
+                && TimeZoneInfo.TryFindSystemTimeZoneById(id, out var browserTz))
+            {
+                EnsureTimeZoneListed(browserTz);
+                _tz = browserTz;
+                SetQuickRange(-30);
+            }
+        }
+        catch (JSException) { /* keep server local time zone */ }
+
+        await RunReportAsync();
+        StateHasChanged();
+    }
+
+    private void OnTimeZoneChanged(ChangeEventArgs e)
+    {
+        if (e.Value?.ToString() is { } id && TimeZoneInfo.TryFindSystemTimeZoneById(id, out var tz))
+            _tz = tz;
+    }
+
+    private void EnsureTimeZoneListed(TimeZoneInfo tz)
+    {
+        if (_timeZones.All(z => z.Id != tz.Id)) _timeZones.Insert(0, tz);
+    }
+
+    private void ToggleDevice(DeviceIdentifier d)
+    {
+        if (!_selectedDevices.Remove(d)) _selectedDevices.Add(d);
+    }
+
+    private void SetQuickRange(int? daysOffset)
+    {
+        if (daysOffset is null) { _from = null; _to = null; return; }
+        var today = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, _tz).Date;
+        _from = today.AddDays(daysOffset.Value + 1);   // "7 days" = today and the 6 before it
+        _to   = today;
+    }
+
+    private async Task RunReportAsync()
+    {
+        _errorMessage = null;
+        _loading      = true;
+        StateHasChanged();
+        try
+        {
+            if (_from > _to) (_from, _to) = (_to, _from);
+
+            var days = await ReportSvc.GetDailySummaryAsync(_selectedDevices, _from, _to, _tz);
+            _days = days;
+
+            // Open-ended bounds fall back to the first/last day that has data
+            var start = _from.HasValue ? DateOnly.FromDateTime(_from.Value) : days.FirstOrDefault()?.Date;
+            var end   = _to.HasValue   ? DateOnly.FromDateTime(_to.Value)   : days.LastOrDefault()?.Date;
+
+            _daysInRange = start is { } s && end is { } e ? Math.Max(0, e.DayNumber - s.DayNumber + 1) : 0;
+            _totalPoints = days.Sum(d => (long)d.Points);
+            _busiest     = days.MaxBy(d => d.Points);
+            _longestStreak = LongestStreak(days);
+
+            _strip = [];
+            if (start is { } a && end is { } b && _daysInRange is > 0 and <= MaxStripDays)
+            {
+                var withData = days.Select(d => d.Date).ToHashSet();
+                for (var d = a; d <= b; d = d.AddDays(1))
+                    _strip.Add((d, withData.Contains(d)));
+            }
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Report failed: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task ExportCsvAsync()
+    {
+        if (_days is null) return;
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append("Date,Points,Devices,First fix,Last fix,Time zone\r\n");
+        foreach (var d in _days)   // ascending by date
+        {
+            sb.Append(string.Join(',',
+                d.Date.ToString("yyyy-MM-dd"),
+                d.Points,
+                d.Devices,
+                d.FirstFix.ToString("yyyy-MM-dd HH:mm:ss"),
+                d.LastFix.ToString("yyyy-MM-dd HH:mm:ss"),
+                CsvField(_tz.Id)));
+            sb.Append("\r\n");
+        }
+
+        var name = $"track-days_{_from:yyyyMMdd}-{_to:yyyyMMdd}.csv".Replace("_-", "_all-").Replace("-.", "-all.");
+        // BOM so Excel reads it as UTF-8
+        await JS.InvokeVoidAsync("downloadText", name, "﻿" + sb, "text/csv;charset=utf-8");
+    }
+
+    private static string CsvField(string s) =>
+        s.AsSpan().IndexOfAny(",\"\r\n") >= 0 ? $"\"{s.Replace("\"", "\"\"")}\"" : s;
+
+    // Deep link to the map for one day, in the report's time zone
+    private string MapUrl(DateOnly date) =>
+        $"/?from={date:yyyy-MM-dd}&to={date:yyyy-MM-dd}&tz={Uri.EscapeDataString(_tz.Id)}";
+
+    private static int LongestStreak(IReadOnlyList<DaySummary> days)
+    {
+        int best = 0, run = 0;
+        DateOnly? prev = null;
+        foreach (var d in days)   // already ordered by date
+        {
+            run  = prev is { } p && d.Date.DayNumber - p.DayNumber == 1 ? run + 1 : 1;
+            best = Math.Max(best, run);
+            prev = d.Date;
+        }
+        return best;
+    }
+
+    private static DateTime? ParseDate(string? s) =>
+        DateTime.TryParse(s, out var d) ? d : null;
+}

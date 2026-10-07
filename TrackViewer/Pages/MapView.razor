@@ -1,0 +1,765 @@
+@page "/"
+@attribute [Authorize]
+@inject LocationQueryService  LocationSvc
+@inject WaypointQueryService  WaypointSvc
+@inject IConfiguration        Config
+@inject IJSRuntime            JS
+@inject NavigationManager     Nav
+@implements IAsyncDisposable
+
+<PageTitle>TrackViewer</PageTitle>
+
+<div class="tv-shell">
+
+    @* ── Navbar ── *@
+    <nav class="tv-navbar">
+        <div class="tv-navbar-brand">
+            <i class="bi bi-map-fill"></i>
+            TrackViewer
+        </div>
+        <button class="tv-navbar-btn" title="Toggle sidebar" @onclick="ToggleSidebar">
+            <i class="bi bi-layout-sidebar"></i>
+        </button>
+        @if (_autoRefreshEnabled)
+        {
+            <span class="tv-navbar-badge" title="Live — refreshes every @_autoRefreshSeconds s">
+                <i class="bi bi-broadcast"></i> Live
+            </span>
+        }
+        <div class="tv-navbar-spacer"></div>
+        @if (_autoRefreshSeconds > 0)
+        {
+            <button class="tv-navbar-btn @(_autoRefreshEnabled ? "active" : "")"
+                    title="@(_autoRefreshEnabled ? "Pause auto-refresh" : "Resume auto-refresh")"
+                    @onclick="ToggleAutoRefresh">
+                <i class="bi @(_autoRefreshEnabled ? "bi-pause-circle" : "bi-play-circle")"></i>
+                <span class="d-none d-md-inline">@(_autoRefreshEnabled ? "Pause" : "Resume")</span>
+            </button>
+        }
+        <a href="/reports" class="tv-navbar-btn" title="Reports">
+            <i class="bi bi-bar-chart-line"></i>
+            <span class="d-none d-md-inline">Reports</span>
+        </a>
+        <a href="/export" class="tv-navbar-btn" title="Export GPX">
+            <i class="bi bi-download"></i>
+            <span class="d-none d-md-inline">Export</span>
+        </a>
+        <form method="post" action="/account/logout" style="margin:0">
+            <button type="submit" class="tv-navbar-btn" title="Sign out">
+                <i class="bi bi-box-arrow-right"></i>
+            </button>
+        </form>
+    </nav>
+
+    <div class="tv-main">
+
+        @* ── Sidebar ── *@
+        <aside class="tv-sidebar @(_sidebarCollapsed ? "collapsed" : "")">
+            <div class="tv-sidebar-inner">
+
+                @* Device list *@
+                <div class="tv-sidebar-section">
+                    <div class="tv-sidebar-label">
+                        <i class="bi bi-phone"></i> Devices
+                    </div>
+                    @foreach (var userGroup in _allDevices.GroupBy(d => d.User))
+                    {
+                        var u = userGroup.Key;
+                        <div class="tv-device-group">
+                            <div class="tv-device-group-header" @onclick="() => ToggleUserGroup(u)">
+                                <i class="bi bi-chevron-@(_expandedUsers.Contains(u) ? "down" : "right") me-1" style="font-size:10px"></i>
+                                <i class="bi bi-person-fill"></i>
+                                @u
+                                <span style="margin-left:auto;font-size:10px;opacity:.6">
+                                    @userGroup.Count(d => _filter.SelectedDevices.Contains(d)) / @userGroup.Count()
+                                </span>
+                            </div>
+                            @if (_expandedUsers.Contains(u))
+                            {
+                                <div style="margin-bottom:.25rem">
+                                    <div style="padding:2px 4px 4px 20px;display:flex;gap:.5rem">
+                                        <button class="tv-quick-btn" @onclick="() => SelectAllUser(u, true)">All</button>
+                                        <button class="tv-quick-btn" @onclick="() => SelectAllUser(u, false)">None</button>
+                                    </div>
+                                    @foreach (var dev in userGroup)
+                                    {
+                                        var d = dev;
+                                        var colour = _deviceColours.GetValueOrDefault(d.ToString(), "#888");
+                                        var lastSeen = _lastSeenMap.TryGetValue(d.ToString(), out var ts)
+                                            ? ts.ToString("MM/dd HH:mm")
+                                            : "";
+                                        <label class="tv-device-row">
+                                            <input type="checkbox"
+                                                   class="form-check-input"
+                                                   checked="@_filter.SelectedDevices.Contains(d)"
+                                                   @onchange="() => ToggleDevice(d)" />
+                                            <span class="tv-device-dot" style="background:@colour"></span>
+                                            <span class="tv-device-name">@d.Device</span>
+                                            <span class="tv-device-ts">@lastSeen</span>
+                                        </label>
+                                    }
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+
+                @* Date range *@
+                <div class="tv-sidebar-section">
+                    <div class="tv-sidebar-label"><i class="bi bi-calendar-range"></i> Date Range</div>
+                    <label style="font-size:11px;color:var(--tv-text-muted);display:block;margin-bottom:.2rem">Time zone</label>
+                    <select class="tv-input mb-2" value="@_filter.TimeZone.Id" @onchange="OnTimeZoneChanged">
+                        @foreach (var tz in _timeZones)
+                        {
+                            <option value="@tz.Id">@tz.DisplayName</option>
+                        }
+                    </select>
+                    <label style="font-size:11px;color:var(--tv-text-muted);display:block;margin-bottom:.2rem">From</label>
+                    <input type="date" class="tv-input mb-2"
+                           value="@(_filter.From?.ToString("yyyy-MM-dd") ?? "")"
+                           @onchange="e => _filter.From = ParseDate(e.Value?.ToString())" />
+                    <label style="font-size:11px;color:var(--tv-text-muted);display:block;margin-bottom:.2rem">To</label>
+                    <input type="date" class="tv-input mb-1"
+                           value="@(_filter.To?.ToString("yyyy-MM-dd") ?? "")"
+                           @onchange="e => _filter.To = ParseDate(e.Value?.ToString())" />
+                    <div class="tv-quick-ranges">
+                        <button class="tv-quick-btn" @onclick="() => SetQuickRange(0)">Today</button>
+                        <button class="tv-quick-btn" @onclick="() => SetQuickRange(-1)">Yesterday</button>
+                        <button class="tv-quick-btn" @onclick="() => SetQuickRange(-7)">7 days</button>
+                        <button class="tv-quick-btn" @onclick="() => SetQuickRange(-30)">30 days</button>
+                        <button class="tv-quick-btn" @onclick="() => SetQuickRange(null)">All</button>
+                    </div>
+                </div>
+
+                @* Playback *@
+                <div class="tv-sidebar-section">
+                    <div class="tv-sidebar-label"><i class="bi bi-play-circle"></i> Playback</div>
+                    <button class="tv-btn" @onclick="OpenPlaybackAsync" disabled="@(_locations.Count == 0)">
+                        <i class="bi bi-play-fill me-1"></i>Replay loaded movements
+                    </button>
+                </div>
+
+                @* Layer toggles *@
+                <div class="tv-sidebar-section">
+                    <div class="tv-sidebar-label"><i class="bi bi-layers"></i> Layers</div>
+                    <div class="tv-toggle-row" title="Only load points inside the current map view; reloads when you pan or zoom">
+                        <span>Visible area only</span>
+                        <input type="checkbox" class="form-check-input"
+                               @bind="_viewportOnly"
+                               @bind:after="OnViewportToggle" />
+                    </div>
+                    <div class="tv-toggle-row">
+                        <span>Tracks</span>
+                        <input type="checkbox" class="form-check-input"
+                               @bind="_filter.ShowTracks"
+                               @bind:after="OnLayerToggle" />
+                    </div>
+                    <div class="tv-toggle-row">
+                        <span>Points <span style="font-size:10px;color:var(--tv-text-muted)">(≤@MaxPointMarkers.ToString("N0"))</span></span>
+                        <input type="checkbox" class="form-check-input"
+                               @bind="_filter.ShowPoints"
+                               @bind:after="OnLayerToggle" />
+                    </div>
+                    <div class="tv-toggle-row">
+                        <span>Waypoints</span>
+                        <input type="checkbox" class="form-check-input"
+                               @bind="_filter.ShowWaypoints"
+                               @bind:after="OnLayerToggle" />
+                    </div>
+                    <div class="tv-toggle-row">
+                        <span>Heatmap</span>
+                        <input type="checkbox" class="form-check-input"
+                               @bind="_filter.ShowHeatmap"
+                               @bind:after="OnLayerToggle" />
+                    </div>
+                </div>
+
+            </div>
+
+            <div class="tv-sidebar-actions">
+                <button class="tv-btn tv-btn-primary" @onclick="ApplyFilter" disabled="@_loading">
+                    @if (_loading) { <i class="bi bi-arrow-repeat spin"></i> }
+                    else           { <i class="bi bi-funnel-fill"></i> }
+                    Apply
+                </button>
+                <button class="tv-btn tv-btn-secondary" @onclick="ResetFilter" disabled="@_loading">
+                    <i class="bi bi-arrow-counterclockwise"></i> Reset
+                </button>
+            </div>
+        </aside>
+
+        @* ── Map pane ── *@
+        <div class="tv-map-pane">
+            @if (_capped)
+            {
+                <div class="tv-cap-banner">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    Result capped at @_maxRows.ToString("N0") rows — tighten the filters to see all data.
+                </div>
+            }
+            @if (_filter.ShowPoints && !_filter.ShowHeatmap && !PointsVisible)
+            {
+                <div class="tv-cap-banner">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    Points hidden: @_locations.Count.ToString("N0") loaded, more than @MaxPointMarkers.ToString("N0") can be drawn. Zoom in and turn on "Visible area only", or shorten the date range.
+                </div>
+            }
+            <div id="map"></div>
+
+            @* Stats bar *@
+            <div class="tv-stats">
+                <div class="tv-stat-item">
+                    <i class="bi bi-geo-alt-fill" style="color:var(--tv-accent)"></i>
+                    <span class="tv-stat-val">@_stats.TotalPoints.ToString("N0")</span> pts
+                </div>
+                <div class="tv-stat-item">
+                    <i class="bi bi-phone-fill" style="color:var(--tv-accent)"></i>
+                    <span class="tv-stat-val">@_stats.TotalDevices</span> devices
+                </div>
+                <div class="tv-stat-item">
+                    <i class="bi bi-signpost-2-fill" style="color:var(--tv-accent)"></i>
+                    <span class="tv-stat-val">@_stats.TotalDistance.ToString("N0")</span> km
+                </div>
+                @if (_stats.EarliestFix.HasValue)
+                {
+                    <div class="tv-stat-item">
+                        <i class="bi bi-clock-history" style="color:var(--tv-accent)"></i>
+                        <span class="tv-stat-val">@FormatFix(_stats.EarliestFix.Value)</span>
+                        →
+                        <span class="tv-stat-val">@FormatFix(_stats.LatestFix!.Value)</span>
+                    </div>
+                }
+                <div style="flex:1"></div>
+                @if (_autoRefreshEnabled)
+                {
+                    <span style="font-size:11px;color:var(--tv-text-muted)">
+                        <i class="bi bi-broadcast" style="color:var(--tv-success)"></i>
+                        refreshes in @_nextRefreshIn s
+                    </span>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .spin { display:inline-block; animation: spin .8s linear infinite; }
+    @@keyframes spin { to { transform: rotate(360deg); } }
+    #map { height: calc(100dvh - var(--tv-navbar-h) - 34px); }
+</style>
+
+@code {
+    // ── State ──────────────────────────────────────────────────────────────────
+    private TrackFilter                 _filter          = new();
+    private List<TimeZoneInfo>          _timeZones       = [];
+    private List<DeviceIdentifier>      _allDevices      = [];
+    private HashSet<string>             _expandedUsers   = [];
+    private Dictionary<string, DateTime> _lastSeenMap   = [];
+    private IReadOnlyList<LocationRecord>  _locations    = [];
+    private IReadOnlyList<WaypointRecord>  _waypoints    = [];
+    private TrackStatistics             _stats           = new();
+    private bool                        _loading         = false;
+    private int MaxPointMarkers = 20_000;
+    private bool PointsVisible => _locations.Count <= MaxPointMarkers;
+    private bool                        _capped          = false;
+    private bool                        _sidebarCollapsed= false;
+    private bool                        _mapInitialised  = false;
+
+    // viewport-limited loading
+    private bool                  _viewportOnly = true;
+    private bool                  _viewBusy;
+    private (double S, double W, double N, double E)? _pendingView;
+    private (double S, double W, double N, double E)? _loadedView;   // null = whole filter loaded
+    private DotNetObjectReference<MapView>? _selfRef;
+
+    // deep links, e.g. /?from=2026-10-01&to=2026-10-01&tz=America/Puerto_Rico
+    [Parameter, SupplyParameterFromQuery(Name = "from")] public string? FromParam { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "to")]   public string? ToParam   { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "tz")]   public string? TzParam   { get; set; }
+    private bool _urlRange;
+
+    // auto-refresh
+    private int             _autoRefreshSeconds;
+    private bool            _autoRefreshEnabled;
+    private int             _nextRefreshIn;
+    private PeriodicTimer?  _timer;
+    private CancellationTokenSource _cts = new();
+    private int             _maxRows;
+
+    // config
+    private string _tileUrl          = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+    private string _tileAttribution  = "© OpenStreetMap contributors © CARTO";
+    private int    _defaultZoom      = 13;
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
+    protected override async Task OnInitializedAsync()
+    {
+        _tileUrl          = Config["Map:TileUrl"]         ?? _tileUrl;
+        _tileAttribution  = Config["Map:TileAttribution"] ?? _tileAttribution;
+        _defaultZoom      = Config.GetValue("Map:DefaultZoom", 13);
+        MaxPointMarkers   = Math.Max(1, Config.GetValue("Map:MaxPointMarkers", 20_000));
+        _autoRefreshSeconds = Config.GetValue("Map:AutoRefreshSeconds", 20);
+        _autoRefreshEnabled = _autoRefreshSeconds > 0;
+        _maxRows            = Config.GetValue("Query:MaxLocationRows", 50_000);
+
+        _allDevices = (await LocationSvc.GetDevicesAsync()).ToList();
+        AssignDeviceColours();
+        foreach (var u in _allDevices.Select(d => d.User).Distinct())
+            _expandedUsers.Add(u);
+
+        // default: select all devices
+        _filter.SelectedDevices = _allDevices.ToHashSet();
+
+        _timeZones = TimeZoneInfo.GetSystemTimeZones().ToList();
+        _filter.TimeZone = TimeZoneInfo.Local;
+        EnsureTimeZoneListed(_filter.TimeZone);
+
+        if (!string.IsNullOrEmpty(TzParam) && TimeZoneInfo.TryFindSystemTimeZoneById(TzParam, out var urlTz))
+        {
+            EnsureTimeZoneListed(urlTz);
+            _filter.TimeZone = urlTz;
+        }
+
+        if (ParseDate(FromParam) is { } urlFrom)
+        {
+            var urlTo = ParseDate(ToParam) ?? urlFrom;
+            _filter.From = urlFrom.Date;
+            _filter.To   = urlTo.Date.AddDays(1).AddSeconds(-1);
+            _urlRange    = true;
+        }
+        else
+        {
+            // default to Today on first load; loading all history is slow
+            SetQuickRange(0);
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        // Prefer the browser's time zone over the server's
+        try
+        {
+            var id = await JS.InvokeAsync<string>("MapInterop.getBrowserTimeZone");
+            if (string.IsNullOrEmpty(TzParam) && !string.IsNullOrEmpty(id) && id != _filter.TimeZone.Id
+                && TimeZoneInfo.TryFindSystemTimeZoneById(id, out var browserTz))
+            {
+                EnsureTimeZoneListed(browserTz);
+                _filter.TimeZone = browserTz;
+                if (!_urlRange) SetQuickRange(0);
+            }
+        }
+        catch (JSException) { /* keep server local time zone */ }
+
+        // Load initial data to find a map centre
+        await LoadDataAsync();
+
+        double? centerLat = _locations.Count > 0 ? _locations[0].Latitude  : null;
+        double? centerLon = _locations.Count > 0 ? _locations[0].Longitude : null;
+
+        _selfRef = DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("MapInterop.init", "map", new
+        {
+            tileUrl         = _tileUrl,
+            tileAttribution = _tileAttribution,
+            defaultZoom     = _defaultZoom,
+            centerLat,
+            centerLon,
+        }, _selfRef);
+        _mapInitialised = true;
+        await JS.InvokeVoidAsync("MapInterop.setDeviceColours", _deviceColours);
+
+        await PushToMapAsync(fitBounds: true);
+        StateHasChanged();
+
+        if (_autoRefreshEnabled)
+            StartRefreshTimer();
+    }
+
+    // ── Data loading ───────────────────────────────────────────────────────────
+    private async Task LoadDataAsync()
+    {
+        var (locs, capped) = await LocationSvc.GetLocationsAsync(_filter);
+        _locations = locs;
+        _capped    = capped;
+        _waypoints = await WaypointSvc.GetWaypointsAsync(_filter.SelectedDevices);
+        _stats     = LocationSvc.ComputeStatistics(_locations);
+        BuildLastSeenMap();
+    }
+
+    private void BuildLastSeenMap()
+    {
+        _lastSeenMap.Clear();
+        foreach (var r in _locations)
+        {
+            var key = $"{r.User}/{r.Device}";
+            var dt  = DateTimeOffset.FromUnixTimeSeconds(r.Timestamp).UtcDateTime;
+            if (!_lastSeenMap.TryGetValue(key, out var existing) || dt > existing)
+                _lastSeenMap[key] = dt;
+        }
+    }
+
+    // ── Map rendering ──────────────────────────────────────────────────────────
+    private async Task PushToMapAsync(bool fitBounds = false)
+    {
+        if (!_mapInitialised) return;
+
+        // Build segmented GeoJSON for tracks
+        var tracksGeoJson  = BuildTracksGeoJson();
+        var pointsGeoJson  = BuildPointsGeoJson();
+        var waypointArr    = BuildWaypointArray();
+        var heatArr        = BuildHeatArray();
+
+        await JS.InvokeVoidAsync("MapInterop.setTracks",    tracksGeoJson);
+        await JS.InvokeVoidAsync("MapInterop.setPoints",    pointsGeoJson);
+        await JS.InvokeVoidAsync("MapInterop.setWaypoints", (object)waypointArr);
+        await JS.InvokeVoidAsync("MapInterop.setHeatmap",   (object)heatArr);
+
+        // Honour layer visibility
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "tracks",    _filter.ShowTracks && !_filter.ShowHeatmap);
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "points",    _filter.ShowPoints && !_filter.ShowHeatmap && PointsVisible);
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "waypoints", _filter.ShowWaypoints);
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "heat",      _filter.ShowHeatmap);
+        if (fitBounds && _locations.Count > 0)
+            await JS.InvokeVoidAsync("MapInterop.fitBounds");
+    }
+
+    private object BuildTracksGeoJson()
+    {
+        var threshold = LocationSvc.TripThresholdMinutes;
+        var features  = new List<object>();
+
+        foreach (var group in _locations.GroupBy(r => (r.User, r.Device)))
+        {
+            var sorted   = group.OrderBy(r => r.Timestamp).ToList();
+            var segments = Segment(sorted, threshold);
+            var segIdx   = 0;
+            foreach (var seg in segments)
+            {
+                if (seg.Count < 2) continue;
+                features.Add(new
+                {
+                    type     = "Feature",
+                    geometry = new
+                    {
+                        type        = "LineString",
+                        coordinates = seg.Select(r => new[] { r.Longitude, r.Latitude }).ToArray()
+                    },
+                    properties = new
+                    {
+                        user    = group.Key.User,
+                        device  = group.Key.Device,
+                        segment = segIdx++
+                    }
+                });
+            }
+        }
+        return new { type = "FeatureCollection", features };
+    }
+
+    private object BuildPointsGeoJson()
+    {
+        var features = _locations.Select(r => new
+        {
+            type     = "Feature",
+            geometry = new { type = "Point", coordinates = new[] { r.Longitude, r.Latitude } },
+            properties = new
+            {
+                user      = r.User,
+                device    = r.Device,
+                timestamp = r.Timestamp,
+                velocity  = r.Velocity,
+                battery   = r.Battery,
+                accuracy  = r.Accuracy,
+                trigger   = r.Trigger,
+                venue     = r.Venue,
+            }
+        }).ToList();
+        return new { type = "FeatureCollection", features };
+    }
+
+    private object[] BuildWaypointArray() =>
+        _waypoints.Select(w => new
+        {
+            lat    = w.Latitude,
+            lon    = w.Longitude,
+            radius = w.Radius,
+            label  = w.Description ?? w.User,
+            device = $"{w.User}/{w.Device}",
+        }).ToArray<object>();
+
+    private object[] BuildHeatArray() =>
+        _filter.ShowHeatmap
+            ? _locations.Select(r => new[] { r.Latitude, r.Longitude, 0.4 }).ToArray<object>()
+            : [];
+
+    private static List<List<LocationRecord>> Segment(List<LocationRecord> records, double threshold)
+    {
+        var result  = new List<List<LocationRecord>>();
+        if (records.Count == 0) return result;
+        var current = new List<LocationRecord> { records[0] };
+        for (var i = 1; i < records.Count; i++)
+        {
+            if ((records[i].Timestamp - records[i - 1].Timestamp) / 60.0 > threshold)
+            {
+                result.Add(current);
+                current = new List<LocationRecord>();
+            }
+            current.Add(records[i]);
+        }
+        result.Add(current);
+        return result;
+    }
+
+    // ── Playback ───────────────────────────────────────────────────────────────
+    private bool _playbackOpen;
+
+    private async Task OpenPlaybackAsync()
+    {
+        if (!_mapInitialised || _locations.Count == 0) return;
+
+        var series = _locations
+            .GroupBy(r => (r.User, r.Device))
+            .Select(g =>
+            {
+                var s = g.OrderBy(r => r.Timestamp).ToList();
+                return new
+                {
+                    key = $"{g.Key.User}/{g.Key.Device}",
+                    t   = s.Select(r => r.Timestamp).ToArray(),
+                    lat = s.Select(r => r.Latitude).ToArray(),
+                    lon = s.Select(r => r.Longitude).ToArray(),
+                };
+            })
+            .ToArray();
+
+        // Intl needs an IANA id; Windows servers report Windows ids
+        var tzId = _filter.TimeZone.Id;
+        if (!tzId.Contains('/') && TimeZoneInfo.TryConvertWindowsIdToIanaId(tzId, out var iana))
+            tzId = iana;
+
+        var gapSeconds = LocationSvc.TripThresholdMinutes * 60;
+        _playbackOpen = await JS.InvokeAsync<bool>("MapInterop.openPlayback", series, tzId, gapSeconds);
+    }
+
+    // ── Viewport-limited loading ───────────────────────────────────────────────
+    private void SetViewBounds((double S, double W, double N, double E)? v)
+    {
+        _loadedView = v;
+        _filter.MinLat = v?.S;
+        _filter.MaxLat = v?.N;
+        _filter.MinLon = v?.W;
+        _filter.MaxLon = v?.E;
+    }
+
+    [JSInvokable]
+    public async Task OnViewChanged(double south, double west, double north, double east)
+    {
+        if (!_viewportOnly || !_mapInitialised) return;
+
+        _pendingView = (south, west, north, east);
+        if (_viewBusy) return;   // the running load will pick up the latest view afterwards
+
+        _viewBusy = true;
+        try
+        {
+            while (_pendingView is { } v)
+            {
+                _pendingView = null;
+
+                // Everything for this filter is already loaded -> nothing to fetch
+                if (!_capped && (_loadedView is null || Contains(_loadedView.Value, v))) continue;
+
+                // Pad by 25% each side so small pans don't trigger a reload; a view spanning the
+                // whole world is just the unbounded query.
+                var padLat = (v.N - v.S) * .25;
+                var padLon = (v.E - v.W) * .25;
+                (double, double, double, double)? bounds = (v.E - v.W) >= 300
+                    ? null
+                    : (Math.Max(-90, v.S - padLat), Math.Max(-180, v.W - padLon),
+                       Math.Min(90, v.N + padLat),  Math.Min(180, v.E + padLon));
+
+                SetViewBounds(bounds);
+                _loading = true;
+                await InvokeAsync(StateHasChanged);
+                await LoadDataAsync();
+                await PushToMapAsync();
+                _loading = false;
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        finally
+        {
+            _viewBusy = false;
+            _loading  = false;
+        }
+    }
+
+    private static bool Contains((double S, double W, double N, double E) outer,
+                                 (double S, double W, double N, double E) inner) =>
+        inner.S >= outer.S && inner.N <= outer.N && inner.W >= outer.W && inner.E <= outer.E;
+
+    private async Task OnViewportToggle()
+    {
+        if (_viewportOnly || _loadedView is null) return;
+        // Switched off while a partial view is loaded -> load everything for the filter again
+        SetViewBounds(null);
+        await LoadDataAsync();
+        await PushToMapAsync();
+    }
+
+    // ── Filter actions ─────────────────────────────────────────────────────────
+    private async Task ApplyFilter()
+    {
+        _loading = true;
+        StateHasChanged();
+        SetViewBounds(null);   // a new filter loads everything, then fits the map to it
+        await LoadDataAsync();
+        await PushToMapAsync(fitBounds: _locations.Count > 0);
+        if (_playbackOpen)   // a new filter invalidates the replay
+        {
+            await JS.InvokeVoidAsync("MapInterop.closePlayback");
+            _playbackOpen = false;
+        }
+        _loading = false;
+    }
+
+    private async Task ResetFilter()
+    {
+        _filter = new TrackFilter { SelectedDevices = _allDevices.ToHashSet(), TimeZone = _filter.TimeZone };
+        SetQuickRange(0);
+        await ApplyFilter();
+    }
+
+    private void OnTimeZoneChanged(ChangeEventArgs e)
+    {
+        if (e.Value?.ToString() is { } id && TimeZoneInfo.TryFindSystemTimeZoneById(id, out var tz))
+            _filter.TimeZone = tz;   // From/To keep their dates; they are now read in the new zone
+    }
+
+    private void EnsureTimeZoneListed(TimeZoneInfo tz)
+    {
+        if (_timeZones.All(z => z.Id != tz.Id)) _timeZones.Insert(0, tz);
+    }
+
+    private string FormatFix(DateTime utc) =>
+        TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), _filter.TimeZone)
+                    .ToString("yyyy-MM-dd");
+
+    private async Task OnLayerToggle()
+    {
+        if (!_mapInitialised) return;
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "tracks",    _filter.ShowTracks && !_filter.ShowHeatmap);
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "points",    _filter.ShowPoints && !_filter.ShowHeatmap && PointsVisible);
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "waypoints", _filter.ShowWaypoints);
+        await JS.InvokeVoidAsync("MapInterop.showLayer", "heat",      _filter.ShowHeatmap);
+        // rebuild heatmap on toggle
+        var heatArr = BuildHeatArray();
+        await JS.InvokeVoidAsync("MapInterop.setHeatmap", (object)heatArr);
+    }
+
+    // ── Device checkbox helpers ────────────────────────────────────────────────
+    private void ToggleDevice(DeviceIdentifier d)
+    {
+        if (!_filter.SelectedDevices.Remove(d))
+            _filter.SelectedDevices.Add(d);
+    }
+
+    private void SelectAllUser(string user, bool select)
+    {
+        foreach (var d in _allDevices.Where(x => x.User == user))
+        {
+            if (select) _filter.SelectedDevices.Add(d);
+            else        _filter.SelectedDevices.Remove(d);
+        }
+    }
+
+    private void ToggleUserGroup(string user)
+    {
+        if (!_expandedUsers.Remove(user))
+            _expandedUsers.Add(user);
+    }
+
+    // ── Date helpers ───────────────────────────────────────────────────────────
+    private static DateTime? ParseDate(string? s) =>
+        DateTime.TryParse(s, out var d) ? d : null;
+
+    private void SetQuickRange(int? daysOffset)
+    {
+        if (daysOffset is null) { _filter.From = null; _filter.To = null; return; }
+        var today = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, _filter.TimeZone).Date;
+        if (daysOffset == 0)  { _filter.From = today;                          _filter.To = today.AddDays(1).AddSeconds(-1); }
+        else if (daysOffset == -1) { _filter.From = today.AddDays(-1);         _filter.To = today.AddSeconds(-1); }
+        else                  { _filter.From = today.AddDays(daysOffset.Value); _filter.To = null; }
+    }
+
+    // ── UI helpers ─────────────────────────────────────────────────────────────
+    private void ToggleSidebar() => _sidebarCollapsed = !_sidebarCollapsed;
+
+    // Each device gets its own hue, spaced by the golden angle so neighbours in the list
+    // are always far apart. Sent to mapInterop.js so map and sidebar agree.
+    private readonly Dictionary<string, string> _deviceColours = new();
+
+    private void AssignDeviceColours()
+    {
+        _deviceColours.Clear();
+        var i = 0;
+        foreach (var d in _allDevices.OrderBy(d => d.User).ThenBy(d => d.Device))
+            _deviceColours[d.ToString()] = $"hsl({(int)(i++ * 137.508 % 360)},70%,55%)";
+    }
+
+    // ── Auto-refresh ───────────────────────────────────────────────────────────
+    private void StartRefreshTimer()
+    {
+        _nextRefreshIn = _autoRefreshSeconds;
+        _timer         = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        _ = RunTimerAsync(_cts.Token);
+    }
+
+    private async Task RunTimerAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (await _timer!.WaitForNextTickAsync(ct))
+            {
+                _nextRefreshIn--;
+                if (_nextRefreshIn <= 0)
+                {
+                    _nextRefreshIn = _autoRefreshSeconds;
+                    var prev = _stats.LatestFix;
+                    await LoadDataAsync();
+                    if (_stats.LatestFix != prev)
+                        await PushToMapAsync();
+                }
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private void ToggleAutoRefresh()
+    {
+        _autoRefreshEnabled = !_autoRefreshEnabled;
+        if (_autoRefreshEnabled)
+        {
+            _cts = new CancellationTokenSource();
+            StartRefreshTimer();
+        }
+        else
+        {
+            _cts.Cancel();
+            _timer?.Dispose();
+            _timer = null;
+        }
+    }
+
+    // ── Disposal ───────────────────────────────────────────────────────────────
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        _timer?.Dispose();
+        _selfRef?.Dispose();
+        await Task.CompletedTask;
+    }
+}

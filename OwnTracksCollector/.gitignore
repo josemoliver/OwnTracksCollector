@@ -1,0 +1,5 @@
+# SQLite database files — created at runtime, must not be committed
+*.db
+*.db-journal
+*.db-shm
+*.db-wal

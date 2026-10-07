@@ -1,0 +1,264 @@
+@page "/export"
+@attribute [Authorize]
+@inject LocationQueryService LocationSvc
+@inject WaypointQueryService WaypointSvc
+@inject IJSRuntime           JS
+
+<PageTitle>Export GPX — TrackViewer</PageTitle>
+
+<div class="tv-export-page">
+    <nav class="tv-navbar">
+        <div class="tv-navbar-brand">
+            <i class="bi bi-map-fill"></i>
+            TrackViewer
+        </div>
+        <a href="/" class="tv-navbar-btn">
+            <i class="bi bi-arrow-left"></i>
+            <span class="d-none d-md-inline">Back to map</span>
+        </a>
+        <div class="tv-navbar-spacer"></div>
+        <form method="post" action="/account/logout" style="margin:0">
+            <button type="submit" class="tv-navbar-btn" title="Sign out">
+                <i class="bi bi-box-arrow-right"></i>
+            </button>
+        </form>
+    </nav>
+
+    <div style="max-width:680px;margin:2rem auto;padding:0 1rem">
+        <h2 class="mb-4" style="color:var(--tv-text-primary);font-size:1.25rem">
+            <i class="bi bi-download me-2" style="color:var(--tv-accent)"></i>
+            Export GPX track
+        </h2>
+
+        @* Step 1: Select devices *@
+        <div class="tv-card mb-4">
+            <div class="tv-card-header">
+                <span class="tv-step-badge">1</span>
+                Devices
+            </div>
+            <div class="tv-card-body">
+                @if (_allDevices.Count == 0)
+                {
+                    <p style="color:var(--tv-text-muted);font-size:13px">No devices found in the database.</p>
+                }
+                else
+                {
+                    <div style="display:flex;gap:.5rem;margin-bottom:.75rem">
+                        <button class="tv-quick-btn" @onclick="() => SetAllDevices(true)">Select all</button>
+                        <button class="tv-quick-btn" @onclick="() => SetAllDevices(false)">Clear all</button>
+                    </div>
+                    @foreach (var userGroup in _allDevices.GroupBy(d => d.User))
+                    {
+                        <div style="margin-bottom:.75rem">
+                            <div style="font-size:12px;font-weight:600;color:var(--tv-text-muted);
+                                        text-transform:uppercase;letter-spacing:.08em;margin-bottom:.35rem">
+                                <i class="bi bi-person-fill me-1"></i>@userGroup.Key
+                            </div>
+                            @foreach (var dev in userGroup)
+                            {
+                                var d = dev;
+                                <label class="tv-device-row">
+                                    <input type="checkbox"
+                                           class="form-check-input"
+                                           checked="@_selectedDevices.Contains(d)"
+                                           @onchange="() => ToggleDevice(d)" />
+                                    <i class="bi bi-phone-fill" style="color:var(--tv-accent)"></i>
+                                    <span class="tv-device-name">@d.Device</span>
+                                </label>
+                            }
+                        </div>
+                    }
+                }
+            </div>
+        </div>
+
+        @* Step 2: Date range *@
+        <div class="tv-card mb-4">
+            <div class="tv-card-header">
+                <span class="tv-step-badge">2</span>
+                Date Range <span style="font-size:12px;font-weight:400;color:var(--tv-text-muted)">(optional)</span>
+            </div>
+            <div class="tv-card-body" style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
+                <div>
+                    <label class="tv-label">From</label>
+                    <input type="date" class="tv-input"
+                           value="@(_from?.ToString("yyyy-MM-dd") ?? "")"
+                           @onchange="e => _from = ParseDate(e.Value?.ToString())" />
+                </div>
+                <div>
+                    <label class="tv-label">To</label>
+                    <input type="date" class="tv-input"
+                           value="@(_to?.ToString("yyyy-MM-dd") ?? "")"
+                           @onchange="e => _to = ParseDate(e.Value?.ToString())" />
+                </div>
+            </div>
+        </div>
+
+        @* Step 3: Waypoints *@
+        <div class="tv-card mb-4">
+            <div class="tv-card-header">
+                <span class="tv-step-badge">3</span>
+                Waypoints
+                <span style="font-size:12px;font-weight:400;color:var(--tv-text-muted)">(optional)</span>
+            </div>
+            <div class="tv-card-body">
+                @if (_loadingWaypoints)
+                {
+                    <p style="color:var(--tv-text-muted);font-size:13px">
+                        <i class="bi bi-arrow-repeat spin me-1"></i>Loading…
+                    </p>
+                }
+                else if (_availableWaypoints.Count == 0)
+                {
+                    <p style="color:var(--tv-text-muted);font-size:13px">
+                        No waypoints for the selected devices.
+                    </p>
+                }
+                else
+                {
+                    <div style="display:flex;gap:.5rem;margin-bottom:.75rem">
+                        <button class="tv-quick-btn" @onclick="() => SetAllWaypoints(true)">Select all</button>
+                        <button class="tv-quick-btn" @onclick="() => SetAllWaypoints(false)">Clear all</button>
+                    </div>
+                    @foreach (var wpt in _availableWaypoints)
+                    {
+                        var w = wpt;
+                        <label class="tv-wpt-row">
+                            <input type="checkbox"
+                                   class="form-check-input"
+                                   checked="@_selectedWaypointIds.Contains(w.Id)"
+                                   @onchange="() => ToggleWaypoint(w.Id)" />
+                            <i class="bi bi-flag-fill" style="color:var(--tv-waypoint-colour)"></i>
+                            <span class="tv-device-name">@(w.Description ?? "(unnamed)")</span>
+                            <span class="tv-device-ts">@($"{w.User}/{w.Device}")</span>
+                        </label>
+                    }
+                }
+            </div>
+        </div>
+
+        @* Download button *@
+        @if (_errorMessage is not null)
+        {
+            <div class="alert alert-danger py-2 px-3 mb-3" role="alert">
+                <i class="bi bi-exclamation-octagon-fill me-1"></i>@_errorMessage
+            </div>
+        }
+
+        <button class="tv-btn tv-btn-primary"
+                @onclick="DownloadAsync"
+                disabled="@(_loading || _selectedDevices.Count == 0)">
+            @if (_loading)
+            {
+                <i class="bi bi-arrow-repeat spin me-1"></i>
+                <span>Preparing…</span>
+            }
+            else
+            {
+                <i class="bi bi-download me-1"></i>
+                <span>Download GPX</span>
+            }
+        </button>
+    </div>
+</div>
+
+<style>
+    .spin { display:inline-block; animation: spin .8s linear infinite; }
+    @@keyframes spin { to { transform: rotate(360deg); } }
+    .tv-label { font-size:12px; color:var(--tv-text-muted); display:block; margin-bottom:.25rem; }
+    --tv-waypoint-colour: #3b9ddd;
+</style>
+
+@code {
+    private List<DeviceIdentifier>    _allDevices          = [];
+    private HashSet<DeviceIdentifier> _selectedDevices     = [];
+    private List<WaypointRecord>      _availableWaypoints  = [];
+    private HashSet<long>             _selectedWaypointIds = [];
+    private DateTime?                 _from;
+    private DateTime?                 _to;
+    private bool                      _loading             = false;
+    private bool                      _loadingWaypoints    = false;
+    private string?                   _errorMessage;
+
+    // Cache selected devices at waypoint-load time to detect change
+    private HashSet<DeviceIdentifier> _lastWaypointQuery = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        _allDevices      = (await LocationSvc.GetDevicesAsync()).ToList();
+        _selectedDevices = _allDevices.ToHashSet();
+        await RefreshWaypointsAsync();
+    }
+
+    // ── Device selection ───────────────────────────────────────────────────────
+    private async Task ToggleDevice(DeviceIdentifier d)
+    {
+        if (!_selectedDevices.Remove(d))
+            _selectedDevices.Add(d);
+        await RefreshWaypointsAsync();
+    }
+
+    private async Task SetAllDevices(bool select)
+    {
+        if (select) _selectedDevices = _allDevices.ToHashSet();
+        else        _selectedDevices.Clear();
+        await RefreshWaypointsAsync();
+    }
+
+    // ── Waypoints ──────────────────────────────────────────────────────────────
+    private async Task RefreshWaypointsAsync()
+    {
+        _loadingWaypoints = true;
+        StateHasChanged();
+        var wpts             = await WaypointSvc.GetWaypointsAsync(_selectedDevices);
+        _availableWaypoints  = wpts.ToList();
+        _selectedWaypointIds = _availableWaypoints.Select(w => w.Id).ToHashSet();
+        _lastWaypointQuery   = _selectedDevices.ToHashSet();
+        _loadingWaypoints    = false;
+    }
+
+    private void ToggleWaypoint(long id)
+    {
+        if (!_selectedWaypointIds.Remove(id))
+            _selectedWaypointIds.Add(id);
+    }
+
+    private void SetAllWaypoints(bool select)
+    {
+        if (select) _selectedWaypointIds = _availableWaypoints.Select(w => w.Id).ToHashSet();
+        else        _selectedWaypointIds.Clear();
+    }
+
+    // ── Download ───────────────────────────────────────────────────────────────
+    private async Task DownloadAsync()
+    {
+        _errorMessage = null;
+        _loading      = true;
+        StateHasChanged();
+        try
+        {
+            var request = new
+            {
+                devices      = _selectedDevices.Select(d => d.ToString()).ToArray(),
+                waypointIds  = _selectedWaypointIds.ToArray(),
+                from         = _from?.ToString("O"),
+                to           = _to?.ToString("O"),
+            };
+
+            var json = System.Text.Json.JsonSerializer.Serialize(request);
+            var filename = $"tracks_{DateTime.UtcNow:yyyyMMdd_HHmmss}.gpx";
+            await JS.InvokeVoidAsync("downloadGpx", "/api/export/gpx", json, filename);
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Export failed: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private static DateTime? ParseDate(string? s) =>
+        DateTime.TryParse(s, out var d) ? d : null;
+}
